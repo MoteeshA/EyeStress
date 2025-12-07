@@ -1,13 +1,42 @@
-import cv2
+import os
 import time
 import threading
 from collections import deque
 
+import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
 import mediapipe as mp
+from dotenv import load_dotenv
+from flask_mail import Mail, Message
+import openai
 
+# ---------------- ENV & OPENAI ----------------
+load_dotenv()
+
+openai.api_key = os.getenv("OPENAI_API_KEY")  # DO NOT hardcode your key
+
+# ---------------- FLASK APP ----------------
 app = Flask(__name__)
+
+# Email (Gmail SMTP) config via .env
+MAIL_SERVER = 'smtp.gmail.com'
+MAIL_PORT = 465
+MAIL_USE_TLS = False
+MAIL_USE_SSL = True
+MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER")
+
+app.config['MAIL_SERVER'] = MAIL_SERVER
+app.config['MAIL_PORT'] = MAIL_PORT
+app.config['MAIL_USE_TLS'] = MAIL_USE_TLS
+app.config['MAIL_USE_SSL'] = MAIL_USE_SSL
+app.config['MAIL_USERNAME'] = MAIL_USERNAME
+app.config['MAIL_PASSWORD'] = MAIL_PASSWORD
+app.config['MAIL_DEFAULT_SENDER'] = MAIL_DEFAULT_SENDER
+
+mail = Mail(app)
 
 # =========================
 # MediaPipe Face Mesh Setup
@@ -15,7 +44,7 @@ app = Flask(__name__)
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     refine_landmarks=True,
-    max_num_faces=3,  # allow up to 3 faces
+    max_num_faces=3,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
@@ -30,10 +59,6 @@ def euclidean(p1, p2):
 
 
 def eye_aspect_ratio(pts):
-    """
-    pts: list of 6 (x,y)
-    EAR = (|p1-p5| + |p2-p4|) / (2 * |p0-p3|)
-    """
     A = euclidean(pts[1], pts[5])
     B = euclidean(pts[2], pts[4])
     C = euclidean(pts[0], pts[3])
@@ -55,9 +80,8 @@ next_person_id = 1
 
 
 def create_person(now, center):
-    """Initialize a new person state."""
     return {
-        "id": None,  # will be set by caller
+        "id": None,  # set by caller
         "center": center,
         "last_seen": now,
 
@@ -93,15 +117,13 @@ def camera_loop():
     DISPLAY_WIDTH = 720
     EMA_ALPHA = 0.35
 
-    # Thresholds (per person)
-    # Raw EAR is used for blink detection, EMA only for smoothing display.
-    LOW_FRAC = 0.78        # close threshold
-    HIGH_FRAC = 0.86       # reopen threshold
-    MIN_CLOSED_MS = 50     # minimum closed duration to count blink
-    REFRACTORY_MS = 150    # minimum gap between blinks
+    LOW_FRAC = 0.78
+    HIGH_FRAC = 0.86
+    MIN_CLOSED_MS = 50
+    REFRACTORY_MS = 150
 
     CALIBRATION_SECONDS = 3.0
-    MATCH_THRESHOLD = 90.0  # pixels, to match faces to existing persons
+    MATCH_THRESHOLD = 90.0
 
     print("[INFO] Camera loop started")
 
@@ -124,13 +146,13 @@ def camera_loop():
 
         if res.multi_face_landmarks:
             for face_landmarks in res.multi_face_landmarks:
-                # Compute center of the face
+                # Center of face
                 xs = [lm.x * w for lm in face_landmarks.landmark]
                 ys = [lm.y * h for lm in face_landmarks.landmark]
                 cx, cy = int(np.mean(xs)), int(np.mean(ys))
                 face_center = (cx, cy)
 
-                # Assign to nearest existing person or create new
+                # Match to existing person
                 assigned_id = None
                 min_dist = float("inf")
                 best_pid = None
@@ -146,7 +168,6 @@ def camera_loop():
                 if best_pid is not None and min_dist < MATCH_THRESHOLD:
                     assigned_id = best_pid
                 else:
-                    # Create new person
                     with frame_lock:
                         assigned_id = next_person_id
                         next_person_id += 1
@@ -167,7 +188,7 @@ def camera_loop():
 
                 seen_ids.add(assigned_id)
 
-                # ---- Eye-specific processing ----
+                # Eye points
                 def get_pts(idx_list):
                     pts = []
                     for i in idx_list:
@@ -180,19 +201,17 @@ def camera_loop():
 
                 leftEAR = eye_aspect_ratio(left_pts)
                 rightEAR = eye_aspect_ratio(right_pts)
-                raw_ear = (leftEAR + rightEAR) / 2.0  # raw EAR for blink logic
+                raw_ear = (leftEAR + rightEAR) / 2.0
 
                 with frame_lock:
-                    # Smooth EAR for display/stress only
                     ema_prev = person["ema_ear"]
                     ema_ear = raw_ear if ema_prev is None else EMA_ALPHA * raw_ear + (1 - EMA_ALPHA) * ema_prev
                     person["ema_ear"] = ema_ear
 
-                    # Draw eye contours
                     cv2.polylines(frame, [np.array(left_pts, dtype=np.int32)], True, (0, 255, 0), 1)
                     cv2.polylines(frame, [np.array(right_pts, dtype=np.int32)], True, (0, 255, 0), 1)
 
-                    # ----- Calibration for this person -----
+                    # Calibration
                     if person["baseline"] is None:
                         elapsed = now - person["calib_start"]
                         person["calib_buf"].append(ema_ear)
@@ -204,7 +223,6 @@ def camera_loop():
                         if elapsed >= CALIBRATION_SECONDS and len(person["calib_buf"]) > 10:
                             arr = np.array(person["calib_buf"])
                             baseline = float(np.percentile(arr, 95))
-                            # Slightly higher clamp for open eyes
                             baseline = float(np.clip(baseline, 0.18, 0.50))
                             person["baseline"] = baseline
                             person["stress"] = "Low / Normal"
@@ -214,7 +232,6 @@ def camera_loop():
                     else:
                         baseline = person["baseline"]
 
-                        # thresholds based on baseline (using RAW EAR for transitions)
                         low_thr = baseline * LOW_FRAC
                         high_thr = baseline * HIGH_FRAC
                         if high_thr <= low_thr:
@@ -225,7 +242,7 @@ def camera_loop():
                         last_blink_time = person["last_blink_time"]
                         blinks = person["blinks"]
 
-                        # Blink detection: use raw_ear vs thresholds
+                        # Blink logic
                         if not closed and raw_ear < low_thr:
                             closed = True
                             closed_start = now
@@ -239,13 +256,12 @@ def camera_loop():
                                 state["logs"].append(f"[BLINK] P{person['id']} -> #{blinks}")
                             closed = False
 
-                        # Store updated blink state
                         person["closed"] = closed
                         person["closed_start"] = closed_start
                         person["last_blink_time"] = last_blink_time
                         person["blinks"] = blinks
 
-                        # Simple stress classification (using EMA)
+                        # Stress classification
                         if ema_ear < baseline * 0.7:
                             person["stress"] = "Very High / Fatigue"
                         elif ema_ear < baseline * 0.8:
@@ -255,7 +271,6 @@ def camera_loop():
                         else:
                             person["stress"] = "Low / Normal"
 
-                        # HUD overlays for this person near the face
                         label = f"P{person['id']}"
                         cv2.putText(frame, label,
                                     (cx - 40, cy - 40),
@@ -275,18 +290,18 @@ def camera_loop():
                         (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # Prune persons not seen for some time
+        # Prune persons
         now2 = time.time()
         with frame_lock:
             to_delete = []
             for pid, pdata in state["persons"].items():
-                if now2 - pdata["last_seen"] > 5.0:  # 5 seconds timeout
+                if now2 - pdata["last_seen"] > 5.0:
                     to_delete.append(pid)
             for pid in to_delete:
                 del state["persons"][pid]
                 state["logs"].append(f"[INFO] P{pid} left frame (removed).")
 
-        # Encode frame as JPEG and store in shared state
+        # Encode JPEG
         ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ret:
             continue
@@ -300,9 +315,69 @@ def camera_loop():
     print("[INFO] Camera loop stopped")
 
 
-# Start the camera thread immediately
+# Start camera thread
 camera_thread = threading.Thread(target=camera_loop, daemon=True)
 camera_thread.start()
+
+
+# =========================
+# Helper: snapshot metrics
+# =========================
+def get_metrics_snapshot():
+    with frame_lock:
+        persons_payload = []
+        for pid, pdata in state["persons"].items():
+            persons_payload.append({
+                "id": pid,
+                "label": f"Person {pid}",
+                "ear": round(pdata.get("ema_ear") or 0.0, 3),
+                "blinks": int(pdata.get("blinks", 0)),
+                "stress": pdata.get("stress", "Calibrating...")
+            })
+        logs_slice = state["logs"][-40:]
+    return persons_payload, logs_slice
+
+
+def generate_ai_stress_summary(persons):
+    if not openai.api_key:
+        return "AI analysis is not available (missing OpenAI API key)."
+
+    if not persons:
+        return "No face was detected during the session, so stress could not be analyzed."
+
+    # Build a simple description string
+    lines = []
+    for p in persons:
+        lines.append(
+            f"{p['label']}: EAR={p['ear']}, blinks={p['blinks']}, stress='{p['stress']}'"
+        )
+    metrics_text = "\n".join(lines)
+
+    prompt = (
+        "You are an assistant interpreting eye blink and EAR-based stress metrics.\n"
+        "Given the following per-person metrics from a short camera session, "
+        "write a friendly short report for the user:\n"
+        "- Explain overall stress level in simple language.\n"
+        "- Mention if anyone seems very fatigued or high stress.\n"
+        "- Give 3-4 practical tips (blink more often, take micro-breaks, drink water, etc.).\n\n"
+        f"Metrics:\n{metrics_text}\n\n"
+        "Write in 2 short paragraphs and one small bullet list."
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You provide calm, clear wellbeing feedback."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            temperature=0.6,
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception as e:
+        print("OpenAI error:", e)
+        return "AI analysis failed due to a technical error."
 
 
 # =========================
@@ -337,22 +412,73 @@ def video_feed():
 
 @app.route("/metrics")
 def metrics():
-    with frame_lock:
-        persons_payload = []
-        for pid, pdata in state["persons"].items():
-            persons_payload.append({
-                "id": pid,
-                "label": f"Person {pid}",
-                "ear": round(pdata.get("ema_ear") or 0.0, 3),
-                "blinks": int(pdata.get("blinks", 0)),
-                "stress": pdata.get("stress", "Calibrating...")
-            })
-        logs_slice = state["logs"][-40:]
-
+    persons_payload, logs_slice = get_metrics_snapshot()
     return jsonify({
         "persons": persons_payload,
         "logs": logs_slice
     })
+
+
+# -------- NEW: send report by email --------
+@app.route("/send_report", methods=["POST"])
+def send_report():
+    user_email = request.form.get("email")
+
+    if not user_email:
+        return "Email is required", 400
+
+    persons_payload, logs_slice = get_metrics_snapshot()
+    ai_summary = generate_ai_stress_summary(persons_payload)
+
+    # Plain text summary of raw metrics
+    metrics_lines = []
+    metrics_lines.append("Session Metrics:")
+    if not persons_payload:
+        metrics_lines.append("  No faces detected in the latest snapshot.")
+    else:
+        for p in persons_payload:
+            metrics_lines.append(
+                f"  {p['label']}: EAR={p['ear']}, Blinks={p['blinks']}, Stress={p['stress']}"
+            )
+
+    metrics_text = "\n".join(metrics_lines)
+
+    logs_text = "\n".join(logs_slice) if logs_slice else "No recent log events."
+
+    body = f"""
+Hello,
+
+Here is your latest eye blink & stress detection report.
+
+{metrics_text}
+
+-------------------------
+AI Interpretation:
+-------------------------
+{ai_summary}
+
+-------------------------
+Recent Events:
+-------------------------
+{logs_text}
+
+This report was generated automatically from your webcam session.
+
+Regards,
+Multi-Person Eye Blink & Stress Detection System
+"""
+
+    try:
+        msg = Message(
+            subject="Your Eye Blink & Stress Detection Report",
+            recipients=[user_email],
+        )
+        msg.body = body
+        mail.send(msg)
+        return render_template("index.html", email_status="Report sent successfully!")
+    except Exception as e:
+        print("Email send error:", e)
+        return render_template("index.html", email_status=f"Failed to send email: {e}")
 
 
 if __name__ == "__main__":

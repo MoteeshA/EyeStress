@@ -5,6 +5,9 @@
   <title>Multi-Person Eye Blink & Stress Detection</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
   <style>
     :root {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -209,11 +212,88 @@
       word-break: break-word;
     }
 
+    .charts-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.5fr);
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    @media (max-width: 900px) {
+      .charts-layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    .chart-card-title {
+      font-size: 0.85rem;
+      margin-bottom: 6px;
+      color: #e5e7eb;
+    }
+
+    .chart-wrapper {
+      position: relative;
+      width: 100%;
+      height: 210px;
+    }
+
     .footer {
       margin-top: 20px;
       text-align: center;
       font-size: 0.75rem;
       color: #6b7280;
+    }
+
+    /* Email form */
+    .email-card {
+      margin-top: 18px;
+    }
+
+    .email-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 8px;
+    }
+
+    .email-input {
+      flex: 1;
+      min-width: 200px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.6);
+      background: #020617;
+      color: #e5e7eb;
+      font-size: 0.85rem;
+      outline: none;
+    }
+
+    .email-input::placeholder {
+      color: #6b7280;
+    }
+
+    .email-button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      font-size: 0.85rem;
+      cursor: pointer;
+      background: linear-gradient(135deg, #38bdf8, #2563eb);
+      color: white;
+      font-weight: 500;
+      transition: transform 0.1s ease, box-shadow 0.1s ease;
+    }
+
+    .email-button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 25px rgba(37, 99, 235, 0.4);
+    }
+
+    .email-status {
+      margin-top: 8px;
+      font-size: 0.8rem;
+      color: #a5b4fc;
     }
   </style>
 </head>
@@ -232,7 +312,6 @@
           <span id="status-text">Streaming from webcam…</span>
         </div>
         <div class="video-wrapper">
-          <!-- MJPEG stream from Flask -->
           <img id="video-feed" src="/video_feed" alt="Video stream not available" />
         </div>
       </div>
@@ -246,17 +325,55 @@
           </div>
         </div>
 
-        <div id="persons-container" class="persons-list">
-          <!-- Person cards injected by JS -->
-        </div>
+        <div id="persons-container" class="persons-list"></div>
 
         <div class="logs">
           <div class="logs-title">Recent events</div>
-          <div id="logs-box">
-            <!-- Logs will be appended here -->
+          <div id="logs-box"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Section -->
+    <div class="card">
+      <div class="charts-layout">
+        <div>
+          <div class="chart-card-title">Blink Count per Person (Live)</div>
+          <div class="chart-wrapper">
+            <canvas id="blink-bar-chart"></canvas>
+          </div>
+        </div>
+
+        <div>
+          <div class="chart-card-title">EAR Trend (Last ~60 samples)</div>
+          <div class="chart-wrapper">
+            <canvas id="ear-line-chart"></canvas>
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- Email Report Section -->
+    <div class="card email-card">
+      <div class="chart-card-title">Get Your Stress Report by Email</div>
+      <p style="font-size: 0.8rem; color: #9ca3af; margin-top: 4px;">
+        Enter your email and we’ll send a summary of the latest stress metrics along with an AI-generated interpretation.
+      </p>
+      <form class="email-form" method="POST" action="/send_report">
+        <input
+          type="email"
+          name="email"
+          class="email-input"
+          placeholder="you@example.com"
+          required
+        />
+        <button type="submit" class="email-button">Send Report</button>
+      </form>
+      {% if email_status %}
+      <div class="email-status">
+        {{ email_status }}
+      </div>
+      {% endif %}
     </div>
 
     <div class="footer">
@@ -274,6 +391,160 @@
       return "badge badge-ok";
     }
 
+    const MAX_POINTS = 60;
+    let blinkBarChart = null;
+    let earLineChart = null;
+    const personDatasetMap = {};
+    const chartColors = ["#38bdf8", "#22c55e", "#f97316"];
+
+    function initCharts() {
+      const blinkCtx = document.getElementById("blink-bar-chart").getContext("2d");
+      const earCtx = document.getElementById("ear-line-chart").getContext("2d");
+
+      blinkBarChart = new Chart(blinkCtx, {
+        type: "bar",
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: "Blinks",
+              data: [],
+              backgroundColor: "rgba(56, 189, 248, 0.6)",
+              borderRadius: 6,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: { enabled: true }
+          },
+          scales: {
+            x: {
+              ticks: { color: "#9ca3af", font: { size: 10 } },
+              grid: { display: false }
+            },
+            y: {
+              ticks: { color: "#9ca3af", font: { size: 10 } },
+              grid: { color: "rgba(55,65,81,0.6)" },
+              beginAtZero: true
+            }
+          },
+          animation: false
+        }
+      });
+
+      earLineChart = new Chart(earCtx, {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: []
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: {
+                color: "#e5e7eb",
+                font: { size: 10 }
+              }
+            },
+            tooltip: {
+              enabled: true,
+              callbacks: {
+                label: function(ctx) {
+                  const v = ctx.parsed.y;
+                  return (v == null ? "No data" : `EAR: ${v.toFixed(3)}`);
+                }
+              }
+            }
+          },
+          scales: {
+            x: {
+              ticks: { display: false },
+              grid: { display: false }
+            },
+            y: {
+              ticks: { color: "#9ca3af", font: { size: 10 } },
+              grid: { color: "rgba(55,65,81,0.6)" }
+            }
+          },
+          elements: {
+            line: { tension: 0.25 },
+            point: { radius: 0 }
+          },
+          animation: false
+        }
+      });
+    }
+
+    function ensureDatasetForPerson(label) {
+      if (personDatasetMap[label] !== undefined) {
+        return earLineChart.data.datasets[personDatasetMap[label]];
+      }
+      const colorIndex = earLineChart.data.datasets.length % chartColors.length;
+      const color = chartColors[colorIndex];
+
+      const ds = {
+        label: label,
+        data: [],
+        borderColor: color,
+        backgroundColor: "rgba(0,0,0,0)",
+        borderWidth: 2,
+        spanGaps: true
+      };
+
+      const len = earLineChart.data.labels.length;
+      for (let i = 0; i < len - 1; i++) {
+        ds.data.push(null);
+      }
+      earLineChart.data.datasets.push(ds);
+      personDatasetMap[label] = earLineChart.data.datasets.length - 1;
+      return ds;
+    }
+
+    function updateCharts(persons) {
+      if (!blinkBarChart || !earLineChart) return;
+
+      const labels = persons.map(p => p.label || `P${p.id}`);
+      const blinkValues = persons.map(p => p.blinks ?? 0);
+
+      blinkBarChart.data.labels = labels;
+      blinkBarChart.data.datasets[0].data = blinkValues;
+      blinkBarChart.update("none");
+
+      const now = new Date();
+      const timeLabel = now.toLocaleTimeString(undefined, { hour12: false });
+
+      earLineChart.data.labels.push(timeLabel);
+      if (earLineChart.data.labels.length > MAX_POINTS) {
+        earLineChart.data.labels.shift();
+      }
+
+      earLineChart.data.datasets.forEach(ds => {
+        ds.data.push(null);
+        if (ds.data.length > MAX_POINTS) {
+          ds.data.shift();
+        }
+      });
+
+      const lastIndex = earLineChart.data.labels.length - 1;
+      persons.forEach(p => {
+        const label = p.label || `P${p.id}`;
+        const ds = ensureDatasetForPerson(label);
+
+        while (ds.data.length < earLineChart.data.labels.length) {
+          ds.data.unshift(null);
+        }
+        ds.data[lastIndex] = p.ear ?? null;
+      });
+
+      earLineChart.update("none");
+    }
+
     async function fetchMetrics() {
       try {
         const res = await fetch("/metrics", { cache: "no-store" });
@@ -282,7 +553,6 @@
         const persons = data.persons || [];
         const logs = data.logs || [];
 
-        // Update person count and status
         document.getElementById("person-count").textContent = persons.length;
         const status = document.getElementById("status-text");
         if (persons.length === 0) {
@@ -291,7 +561,6 @@
           status.textContent = `Streaming… ${persons.length} person(s) detected`;
         }
 
-        // Render person cards
         const container = document.getElementById("persons-container");
         container.innerHTML = "";
 
@@ -336,7 +605,6 @@
           });
         }
 
-        // Render logs
         const logsBox = document.getElementById("logs-box");
         logsBox.innerHTML = "";
         logs.forEach(line => {
@@ -345,15 +613,19 @@
           div.textContent = line;
           logsBox.appendChild(div);
         });
+
+        updateCharts(persons);
       } catch (err) {
         console.error("Error fetching /metrics:", err);
         document.getElementById("status-text").textContent = "Connection issue…";
       }
     }
 
-    // Poll metrics regularly
-    setInterval(fetchMetrics, 600); // every 600 ms
-    fetchMetrics();
+    document.addEventListener("DOMContentLoaded", () => {
+      initCharts();
+      fetchMetrics();
+      setInterval(fetchMetrics, 600);
+    });
   </script>
 </body>
 </html>
