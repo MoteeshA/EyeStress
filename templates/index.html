@@ -74,7 +74,6 @@
       object-fit: cover;
     }
 
-    /* pill row */
     .pill-row {
       display: flex;
       justify-content: space-between;
@@ -252,7 +251,6 @@
       color: #6b7280;
     }
 
-    /* Email form */
     .email-card {
       margin-top: 18px;
     }
@@ -304,7 +302,6 @@
       color: #a5b4fc;
     }
 
-    /* camera hide/show button */
     .camera-toggle-btn {
       padding: 6px 12px;
       border-radius: 999px;
@@ -540,10 +537,8 @@
     function syncDatasetsWithPersons(persons) {
       const activeLabels = new Set(persons.map(p => p.label || `P${p.id}`));
 
-      // Remove datasets for persons no longer active
       earLineChart.data.datasets = earLineChart.data.datasets.filter(ds => activeLabels.has(ds.label));
 
-      // Rebuild map
       Object.keys(personDatasetMap).forEach(label => {
         if (!activeLabels.has(label)) {
           delete personDatasetMap[label];
@@ -557,7 +552,6 @@
     function updateCharts(persons) {
       if (!blinkBarChart || !earLineChart) return;
 
-      // If no persons, clear charts so no ghost lines remain
       if (persons.length === 0) {
         blinkBarChart.data.labels = [];
         blinkBarChart.data.datasets[0].data = [];
@@ -570,7 +564,6 @@
         return;
       }
 
-      // Sync datasets to active persons
       syncDatasetsWithPersons(persons);
 
       const labels = persons.map(p => p.label || `P${p.id}`);

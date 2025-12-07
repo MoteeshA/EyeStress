@@ -17,6 +17,12 @@ load_dotenv()
 # Old-style OpenAI usage to match your current code
 openai.api_key = os.getenv("OPENAI_API_KEY")  # DO NOT hardcode your key
 
+# Detect headless / Render environment (no real webcam)
+IS_HEADLESS = (
+    os.environ.get("RENDER", "").lower() == "true"
+    or os.environ.get("DISABLE_CAMERA", "0") == "1"
+)
+
 # ---------------- FLASK APP ----------------
 app = Flask(__name__)
 
@@ -104,16 +110,14 @@ def create_person(now, center):
 
 
 # =========================
-# Camera Processing Loop
+# Camera / Headless Loop
 # =========================
 def camera_loop():
+    """
+    - Locally: open webcam and run full pipeline.
+    - On Render/headless: don't touch /dev/video0; just stream a placeholder frame.
+    """
     global current_frame, running, next_person_id
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] Could not open webcam.")
-        running = False
-        return
 
     DISPLAY_WIDTH = 720
     EMA_ALPHA = 0.35
@@ -125,6 +129,35 @@ def camera_loop():
 
     CALIBRATION_SECONDS = 3.0
     MATCH_THRESHOLD = 90.0
+
+    if IS_HEADLESS:
+        print("[INFO] Headless environment detected – skipping webcam capture.")
+        # Generate a simple static placeholder frame and keep reusing it.
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(
+            frame,
+            "No camera available on server",
+            (40, 180),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        placeholder = buffer.tobytes() if ret else None
+
+        while running:
+            with frame_lock:
+                current_frame = placeholder
+            time.sleep(0.5)
+        print("[INFO] Headless loop stopped")
+        return
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[ERROR] Could not open webcam.")
+        running = False
+        return
 
     print("[INFO] Camera loop started")
 
@@ -147,7 +180,6 @@ def camera_loop():
 
         if res.multi_face_landmarks:
             for face_landmarks in res.multi_face_landmarks:
-                # Center of face
                 xs = [lm.x * w for lm in face_landmarks.landmark]
                 ys = [lm.y * h for lm in face_landmarks.landmark]
                 cx, cy = int(np.mean(xs)), int(np.mean(ys))
@@ -189,7 +221,6 @@ def camera_loop():
 
                 seen_ids.add(assigned_id)
 
-                # Eye points
                 def get_pts(idx_list):
                     pts = []
                     for i in idx_list:
@@ -316,7 +347,7 @@ def camera_loop():
     print("[INFO] Camera loop stopped")
 
 
-# Start camera thread immediately (works fine for python app.py)
+# Start camera thread immediately
 camera_thread = threading.Thread(target=camera_loop, daemon=True)
 camera_thread.start()
 
@@ -340,11 +371,6 @@ def get_metrics_snapshot():
 
 
 def generate_ai_stress_summary(persons):
-    """
-    Uses OpenAI ONLY on final snapshot (email report) to generate:
-    - Overall stress rating: Low/Moderate/High/Very High
-    - Short explanation + tips
-    """
     if not openai.api_key:
         return "AI analysis is not available (missing OpenAI API key)."
 
@@ -355,7 +381,6 @@ def generate_ai_stress_summary(persons):
             "Try sitting closer to the camera with good lighting and keep your eyes open normally."
         )
 
-    # Build a simple description string
     lines = []
     for p in persons:
         lines.append(
@@ -380,7 +405,7 @@ def generate_ai_stress_summary(persons):
 
     try:
         resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",  # you can change this if you want
+            model="gpt-3.5-turbo",
             messages=[
                 {
                     "role": "system",
@@ -403,7 +428,6 @@ def generate_ai_stress_summary(persons):
 
 @app.route("/")
 def index():
-    # email_status optionally passed during send_report
     return render_template("index.html")
 
 
@@ -431,14 +455,12 @@ def video_feed():
 @app.route("/metrics")
 def metrics():
     persons_payload, logs_slice = get_metrics_snapshot()
-    # We do NOT call OpenAI here to avoid spamming the API every 600ms.
     return jsonify({
         "persons": persons_payload,
         "logs": logs_slice
     })
 
 
-# -------- send report by email + AI summary --------
 @app.route("/send_report", methods=["POST"])
 def send_report():
     user_email = request.form.get("email")
@@ -449,7 +471,6 @@ def send_report():
     persons_payload, logs_slice = get_metrics_snapshot()
     ai_summary = generate_ai_stress_summary(persons_payload)
 
-    # Plain text summary of raw metrics
     metrics_lines = []
     metrics_lines.append("Session Metrics:")
     if not persons_payload:
@@ -461,7 +482,6 @@ def send_report():
             )
 
     metrics_text = "\n".join(metrics_lines)
-
     logs_text = "\n".join(logs_slice) if logs_slice else "No recent log events."
 
     body = f"""
@@ -502,4 +522,5 @@ Multi-Person Eye Blink & Stress Detection System
 
 
 if __name__ == "__main__":
+    # Local run
     app.run(debug=True, host="0.0.0.0", port=5011)
