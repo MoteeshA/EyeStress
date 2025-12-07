@@ -14,6 +14,7 @@ import openai
 # ---------------- ENV & OPENAI ----------------
 load_dotenv()
 
+# Old-style OpenAI usage to match your current code
 openai.api_key = os.getenv("OPENAI_API_KEY")  # DO NOT hardcode your key
 
 # ---------------- FLASK APP ----------------
@@ -261,7 +262,7 @@ def camera_loop():
                         person["last_blink_time"] = last_blink_time
                         person["blinks"] = blinks
 
-                        # Stress classification
+                        # Local stress classification (heuristic)
                         if ema_ear < baseline * 0.7:
                             person["stress"] = "Very High / Fatigue"
                         elif ema_ear < baseline * 0.8:
@@ -315,7 +316,7 @@ def camera_loop():
     print("[INFO] Camera loop stopped")
 
 
-# Start camera thread
+# Start camera thread immediately (works fine for python app.py)
 camera_thread = threading.Thread(target=camera_loop, daemon=True)
 camera_thread.start()
 
@@ -339,39 +340,55 @@ def get_metrics_snapshot():
 
 
 def generate_ai_stress_summary(persons):
+    """
+    Uses OpenAI ONLY on final snapshot (email report) to generate:
+    - Overall stress rating: Low/Moderate/High/Very High
+    - Short explanation + tips
+    """
     if not openai.api_key:
         return "AI analysis is not available (missing OpenAI API key)."
 
     if not persons:
-        return "No face was detected during the session, so stress could not be analyzed."
+        return (
+            "Overall stress rating: Not Measurable\n\n"
+            "No face was detected during this session, so stress could not be analyzed. "
+            "Try sitting closer to the camera with good lighting and keep your eyes open normally."
+        )
 
     # Build a simple description string
     lines = []
     for p in persons:
         lines.append(
-            f"{p['label']}: EAR={p['ear']}, blinks={p['blinks']}, stress='{p['stress']}'"
+            f"{p['label']}: EAR={p['ear']}, blinks={p['blinks']}, stress_tag='{p['stress']}'"
         )
     metrics_text = "\n".join(lines)
 
     prompt = (
-        "You are an assistant interpreting eye blink and EAR-based stress metrics.\n"
-        "Given the following per-person metrics from a short camera session, "
-        "write a friendly short report for the user:\n"
-        "- Explain overall stress level in simple language.\n"
-        "- Mention if anyone seems very fatigued or high stress.\n"
-        "- Give 3-4 practical tips (blink more often, take micro-breaks, drink water, etc.).\n\n"
-        f"Metrics:\n{metrics_text}\n\n"
-        "Write in 2 short paragraphs and one small bullet list."
+        "You are an assistant interpreting eye blink and EAR-based drowsiness/stress metrics.\n"
+        "The model is NOT making any medical or mental-health diagnosis; only give a rough, "
+        "everyday reading in terms of alert vs tired.\n\n"
+        "Given the following per-person metrics from a short camera session:\n"
+        f"{metrics_text}\n\n"
+        "1) First, output a single line:\n"
+        "   Overall stress rating: Low / Moderate / High / Very High\n"
+        "   (choose exactly one word: Low, Moderate, High, or Very High).\n"
+        "2) Then, in 2 short paragraphs, explain in simple language what this means.\n"
+        "3) Finally, give a bullet list with 3–4 practical tips "
+        "(blink more often, take micro-breaks, drink water, adjust lighting, etc.).\n"
+        "4) Keep everything friendly and non-clinical.\n"
     )
 
     try:
         resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo",  # you can change this if you want
             messages=[
-                {"role": "system", "content": "You provide calm, clear wellbeing feedback."},
+                {
+                    "role": "system",
+                    "content": "You provide calm, clear, non-medical wellbeing feedback based on simple metrics."
+                },
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=300,
+            max_tokens=400,
             temperature=0.6,
         )
         return resp.choices[0].message["content"].strip()
@@ -386,6 +403,7 @@ def generate_ai_stress_summary(persons):
 
 @app.route("/")
 def index():
+    # email_status optionally passed during send_report
     return render_template("index.html")
 
 
@@ -413,13 +431,14 @@ def video_feed():
 @app.route("/metrics")
 def metrics():
     persons_payload, logs_slice = get_metrics_snapshot()
+    # We do NOT call OpenAI here to avoid spamming the API every 600ms.
     return jsonify({
         "persons": persons_payload,
         "logs": logs_slice
     })
 
 
-# -------- NEW: send report by email --------
+# -------- send report by email + AI summary --------
 @app.route("/send_report", methods=["POST"])
 def send_report():
     user_email = request.form.get("email")
@@ -438,7 +457,7 @@ def send_report():
     else:
         for p in persons_payload:
             metrics_lines.append(
-                f"  {p['label']}: EAR={p['ear']}, Blinks={p['blinks']}, Stress={p['stress']}"
+                f"  {p['label']}: EAR={p['ear']}, Blinks={p['blinks']}, StressTag={p['stress']}"
             )
 
     metrics_text = "\n".join(metrics_lines)
@@ -453,7 +472,7 @@ Here is your latest eye blink & stress detection report.
 {metrics_text}
 
 -------------------------
-AI Interpretation:
+AI Interpretation (non-medical):
 -------------------------
 {ai_summary}
 
@@ -463,6 +482,7 @@ Recent Events:
 {logs_text}
 
 This report was generated automatically from your webcam session.
+This is NOT a medical diagnosis, only an approximate indication of eye fatigue / alertness.
 
 Regards,
 Multi-Person Eye Blink & Stress Detection System

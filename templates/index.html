@@ -74,6 +74,15 @@
       object-fit: cover;
     }
 
+    /* pill row */
+    .pill-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
     .pill {
       display: inline-flex;
       align-items: center;
@@ -84,7 +93,6 @@
       border: 1px solid rgba(148, 163, 184, 0.4);
       color: #e5e7eb;
       background: linear-gradient(135deg, #0f172a, #020617);
-      margin-bottom: 8px;
     }
 
     .pill-dot {
@@ -295,6 +303,24 @@
       font-size: 0.8rem;
       color: #a5b4fc;
     }
+
+    /* camera hide/show button */
+    .camera-toggle-btn {
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.5);
+      background: #020617;
+      color: #e5e7eb;
+      font-size: 0.75rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.1s ease, transform 0.1s ease;
+    }
+
+    .camera-toggle-btn:hover {
+      background: #0f172a;
+      transform: translateY(-0.5px);
+    }
   </style>
 </head>
 <body>
@@ -307,9 +333,14 @@
     <div class="layout">
       <!-- Left: Video -->
       <div class="card">
-        <div class="pill">
-          <span class="pill-dot"></span>
-          <span id="status-text">Streaming from webcam…</span>
+        <div class="pill-row">
+          <div class="pill">
+            <span class="pill-dot"></span>
+            <span id="status-text">Streaming from webcam…</span>
+          </div>
+          <button id="camera-toggle" class="camera-toggle-btn">
+            Hide Camera
+          </button>
         </div>
         <div class="video-wrapper">
           <img id="video-feed" src="/video_feed" alt="Video stream not available" />
@@ -506,8 +537,41 @@
       return ds;
     }
 
+    function syncDatasetsWithPersons(persons) {
+      const activeLabels = new Set(persons.map(p => p.label || `P${p.id}`));
+
+      // Remove datasets for persons no longer active
+      earLineChart.data.datasets = earLineChart.data.datasets.filter(ds => activeLabels.has(ds.label));
+
+      // Rebuild map
+      Object.keys(personDatasetMap).forEach(label => {
+        if (!activeLabels.has(label)) {
+          delete personDatasetMap[label];
+        }
+      });
+      earLineChart.data.datasets.forEach((ds, idx) => {
+        personDatasetMap[ds.label] = idx;
+      });
+    }
+
     function updateCharts(persons) {
       if (!blinkBarChart || !earLineChart) return;
+
+      // If no persons, clear charts so no ghost lines remain
+      if (persons.length === 0) {
+        blinkBarChart.data.labels = [];
+        blinkBarChart.data.datasets[0].data = [];
+        blinkBarChart.update("none");
+
+        earLineChart.data.labels = [];
+        earLineChart.data.datasets = [];
+        Object.keys(personDatasetMap).forEach(k => delete personDatasetMap[k]);
+        earLineChart.update("none");
+        return;
+      }
+
+      // Sync datasets to active persons
+      syncDatasetsWithPersons(persons);
 
       const labels = persons.map(p => p.label || `P${p.id}`);
       const blinkValues = persons.map(p => p.blinks ?? 0);
@@ -625,6 +689,24 @@
       initCharts();
       fetchMetrics();
       setInterval(fetchMetrics, 600);
+
+      const toggleBtn = document.getElementById("camera-toggle");
+      const videoEl = document.getElementById("video-feed");
+      const statusText = document.getElementById("status-text");
+      let isHidden = false;
+
+      toggleBtn.addEventListener("click", () => {
+        isHidden = !isHidden;
+        if (isHidden) {
+          videoEl.style.display = "none";
+          toggleBtn.textContent = "Show Camera";
+          statusText.textContent = "Camera hidden (stream still running)…";
+        } else {
+          videoEl.style.display = "block";
+          toggleBtn.textContent = "Hide Camera";
+          statusText.textContent = "Streaming from webcam…";
+        }
+      });
     });
   </script>
 </body>
