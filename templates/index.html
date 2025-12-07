@@ -65,9 +65,10 @@
       overflow: hidden;
       background: #000;
       border: 1px solid rgba(148, 163, 184, 0.4);
+      position: relative;
     }
 
-    .video-wrapper img {
+    video {
       display: block;
       width: 100%;
       height: auto;
@@ -318,6 +319,19 @@
       background: #0f172a;
       transform: translateY(-0.5px);
     }
+
+    .camera-warning {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #9ca3af;
+      font-size: 0.85rem;
+      padding: 0 16px;
+      text-align: center;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -333,14 +347,19 @@
         <div class="pill-row">
           <div class="pill">
             <span class="pill-dot"></span>
-            <span id="status-text">Streaming from webcam…</span>
+            <span id="status-text">Waiting for camera permission…</span>
           </div>
           <button id="camera-toggle" class="camera-toggle-btn">
-            Hide Camera
+            Start Camera
           </button>
         </div>
         <div class="video-wrapper">
-          <img id="video-feed" src="/video_feed" alt="Video stream not available" />
+          <video id="video" autoplay muted playsinline></video>
+          <div id="camera-msg" class="camera-warning">
+            Allow camera access in your browser to start analysis.
+          </div>
+          <!-- hidden canvas used for capturing frames -->
+          <canvas id="capture-canvas" style="display:none;"></canvas>
         </div>
       </div>
 
@@ -424,6 +443,10 @@
     let earLineChart = null;
     const personDatasetMap = {};
     const chartColors = ["#38bdf8", "#22c55e", "#f97316"];
+
+    let stream = null;
+    let captureRunning = false;
+    let cameraActive = false;
 
     function initCharts() {
       const blinkCtx = document.getElementById("blink-bar-chart").getContext("2d");
@@ -612,10 +635,12 @@
 
         document.getElementById("person-count").textContent = persons.length;
         const status = document.getElementById("status-text");
-        if (persons.length === 0) {
-          status.textContent = "Streaming… no faces detected";
+        if (!cameraActive) {
+          status.textContent = "Camera not started";
+        } else if (persons.length === 0) {
+          status.textContent = "Camera on… no faces detected";
         } else {
-          status.textContent = `Streaming… ${persons.length} person(s) detected`;
+          status.textContent = `Camera on… ${persons.length} person(s) detected`;
         }
 
         const container = document.getElementById("persons-container");
@@ -678,26 +703,118 @@
       }
     }
 
+    function startCaptureLoop() {
+      if (captureRunning) return;
+      captureRunning = true;
+
+      const videoEl = document.getElementById("video");
+      const canvas = document.getElementById("capture-canvas");
+      const ctx = canvas.getContext("2d");
+      const TARGET_FPS = 3; // send ~3 frames/sec to server
+
+      async function capture() {
+        if (!cameraActive || !stream) {
+          captureRunning = false;
+          return;
+        }
+
+        const w = videoEl.videoWidth;
+        const h = videoEl.videoHeight;
+        if (w === 0 || h === 0) {
+          requestAnimationFrame(capture);
+          return;
+        }
+
+        canvas.width = w;
+        canvas.height = h;
+        ctx.drawImage(videoEl, 0, 0, w, h);
+
+        canvas.toBlob(async (blob) => {
+          if (!blob || !cameraActive) {
+            requestAnimationFrame(capture);
+            return;
+          }
+          try {
+            const formData = new FormData();
+            formData.append("frame", blob, "frame.jpg");
+            await fetch("/process_frame", {
+              method: "POST",
+              body: formData
+            });
+          } catch (e) {
+            console.error("Error sending frame:", e);
+          }
+          setTimeout(() => requestAnimationFrame(capture), 1000 / TARGET_FPS);
+        }, "image/jpeg", 0.7);
+      }
+
+      requestAnimationFrame(capture);
+    }
+
+    async function startCamera() {
+      const videoEl = document.getElementById("video");
+      const status = document.getElementById("status-text");
+      const msg = document.getElementById("camera-msg");
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false
+        });
+        videoEl.srcObject = stream;
+        cameraActive = true;
+        msg.style.display = "none";
+        status.textContent = "Camera active. Sit in front of the camera.";
+        startCaptureLoop();
+      } catch (err) {
+        console.error("Error accessing camera:", err);
+        cameraActive = false;
+        status.textContent = "Cannot access camera. Check permissions.";
+        msg.textContent = "Camera access blocked. Enable it in browser site settings and click Start Camera again.";
+      }
+    }
+
+    function stopCameraStream() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      cameraActive = false;
+    }
+
     document.addEventListener("DOMContentLoaded", () => {
       initCharts();
       fetchMetrics();
       setInterval(fetchMetrics, 600);
 
       const toggleBtn = document.getElementById("camera-toggle");
-      const videoEl = document.getElementById("video-feed");
+      const videoEl = document.getElementById("video");
       const statusText = document.getElementById("status-text");
-      let isHidden = false;
 
-      toggleBtn.addEventListener("click", () => {
-        isHidden = !isHidden;
-        if (isHidden) {
-          videoEl.style.display = "none";
-          toggleBtn.textContent = "Show Camera";
-          statusText.textContent = "Camera hidden (stream still running)…";
-        } else {
+      toggleBtn.addEventListener("click", async () => {
+        // If camera hasn't been started yet, start it
+        if (!cameraActive && !stream) {
+          toggleBtn.disabled = true;
+          toggleBtn.textContent = "Starting…";
+          await startCamera();
+          toggleBtn.disabled = false;
+          toggleBtn.textContent = "Hide Camera";
+          return;
+        }
+
+        // Camera is active: toggle only visibility (analysis keeps running)
+        if (videoEl.style.display === "none") {
           videoEl.style.display = "block";
           toggleBtn.textContent = "Hide Camera";
-          statusText.textContent = "Streaming from webcam…";
+          if (cameraActive) {
+            statusText.textContent = "Camera active. Sit in front of the camera.";
+          }
+        } else {
+          videoEl.style.display = "none";
+          toggleBtn.textContent = "Show Camera";
+          if (cameraActive) {
+            statusText.textContent = "Camera hidden, analysis still running…";
+          }
         }
       });
     });
