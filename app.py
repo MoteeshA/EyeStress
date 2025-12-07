@@ -1,6 +1,5 @@
 import os
 import time
-import threading
 from collections import deque
 
 import cv2
@@ -53,7 +52,7 @@ LEFT_EYE_IDX = [33, 159, 145, 133, 153, 144]
 RIGHT_EYE_IDX = [362, 386, 374, 263, 380, 373]
 
 # =========================
-# Constants
+# Constants (same logic as original)
 # =========================
 DISPLAY_WIDTH = 720
 EMA_ALPHA = 0.35
@@ -87,7 +86,14 @@ state = {
     "logs": []
 }
 
-frame_lock = threading.Lock()
+
+# no real threading here, but keep the same API
+class DummyLock:
+    def __enter__(self): ...
+    def __exit__(self, exc_type, exc_val, exc_tb): ...
+
+
+frame_lock = DummyLock()
 next_person_id = 1
 
 
@@ -111,6 +117,9 @@ def create_person(now, center):
         "closed": False,
         "closed_start": 0.0,
         "last_blink_time": 0.0,
+
+        # overlay info (normalized coords)
+        "overlay": None,
     }
 
 
@@ -119,6 +128,7 @@ def process_frame_server(frame_bgr):
     Process a single BGR frame from the browser webcam:
     - detect faces with MediaPipe
     - update global state (persons, EAR, blinks, stress)
+    - store normalized overlay coordinates for front-end canvas
     """
     global next_person_id
 
@@ -187,9 +197,20 @@ def process_frame_server(frame_bgr):
                 rightEAR = eye_aspect_ratio(right_pts)
                 raw_ear = (leftEAR + rightEAR) / 2.0
 
+                # update EMA EAR
                 ema_prev = person["ema_ear"]
                 ema_ear = raw_ear if ema_prev is None else EMA_ALPHA * raw_ear + (1 - EMA_ALPHA) * ema_prev
                 person["ema_ear"] = ema_ear
+
+                # store overlay info (normalized coordinates) for front-end canvas
+                left_norm = [[x / w, y / h] for (x, y) in left_pts]
+                right_norm = [[x / w, y / h] for (x, y) in right_pts]
+                person["overlay"] = {
+                    "cx": cx / w,
+                    "cy": cy / h,
+                    "left_eye": left_norm,
+                    "right_eye": right_norm,
+                }
 
                 # Calibration
                 if person["baseline"] is None:
@@ -270,7 +291,8 @@ def get_metrics_snapshot():
                 "label": f"Person {pid}",
                 "ear": round(pdata.get("ema_ear") or 0.0, 3),
                 "blinks": int(pdata.get("blinks", 0)),
-                "stress": pdata.get("stress", "Calibrating...")
+                "stress": pdata.get("stress", "Calibrating..."),
+                "overlay": pdata.get("overlay"),  # normalized coords
             })
         logs_slice = state["logs"][-40:]
     return persons_payload, logs_slice
